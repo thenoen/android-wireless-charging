@@ -1,56 +1,190 @@
 #!/usr/bin/env bash
 
 # ============================================================
-# Pixel 8a Wireless Charging Monitor v4.1
+# Pixel 8a / VW Golf Wireless Charging Monitor
+# v5.1
 #
-# Google Pixel 8a + VW Golf wireless charging pad
+# Primary positioning metric:
+#   DC input power from /sys/class/power_supply/dc/
 #
-# Dynamic position quality:
-#   - Uses the highest 5-second average measured this session
-#     as the dynamic maximum.
-#   - Position quality = current 5-sec average / session max.
-#
-# No CSV logging.
+# Features:
+#   - 1 sec refresh
+#   - 5 sec moving average
+#   - Dynamic session peak
+#   - Position quality score
+#   - Color-coded compact dashboard
+#   - DC input / charger / battery data
+#   - Android charging limits
+#   - No CSV logging
 # ============================================================
 
 INTERVAL=1
 AVG_SECONDS=5
-MAX_SAMPLES=$((AVG_SECONDS / INTERVAL))
 
-# Dynamic maximum charging current seen during this session
-max_avg_current_ua=0
-
-# Peak instantaneous current
-peak_current_ua=0
-
-declare -a samples=()
+ADB="adb"
 
 # ------------------------------------------------------------
-# Helper functions
+# Colors
 # ------------------------------------------------------------
 
-get_battery_value() {
-    adb shell dumpsys battery 2>/dev/null |
-        sed 's/\r//' |
-        grep -m1 -E "^[[:space:]]*$1:" |
-        sed -E 's/^[[:space:]]*[^:]+:[[:space:]]*//'
-}
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
 
-get_current() {
-    adb shell cat /sys/class/power_supply/battery/current_now 2>/dev/null
-}
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[34m'
+CYAN='\033[36m'
+WHITE='\033[37m'
+MAGENTA='\033[35m'
+
+BG_GREEN='\033[42;30m'
+BG_YELLOW='\033[43;30m'
+BG_RED='\033[41;37m'
+BG_BLUE='\033[44;37m'
+
 
 # ------------------------------------------------------------
-# Check ADB
+# ADB
 # ------------------------------------------------------------
 
-if ! adb get-state >/dev/null 2>&1; then
-    echo "ERROR: Pixel 8a not connected through ADB."
-    echo
-    echo "Check with:"
-    echo "  adb devices"
+if ! $ADB get-state >/dev/null 2>&1; then
+    echo -e "${RED}ERROR:${RESET} ADB device not available."
+    echo "Run: adb devices"
     exit 1
 fi
+
+
+# ------------------------------------------------------------
+# Read sysfs safely
+#
+# IMPORTANT:
+# Some Pixel sysfs nodes can occasionally return more than
+# one line / stale values. We explicitly select the first
+# valid numeric line.
+# ------------------------------------------------------------
+
+read_num() {
+    local path="$1"
+
+    $ADB shell "cat '$path' 2>/dev/null" 2>/dev/null |
+        tr -d '\r' |
+        grep -m1 -E '^-?[0-9]+$'
+}
+
+
+read_text() {
+    local path="$1"
+
+    $ADB shell "cat '$path' 2>/dev/null" 2>/dev/null |
+        tr -d '\r' |
+        head -n1
+}
+
+
+num() {
+    local v="$1"
+
+    if [[ "$v" =~ ^-?[0-9]+$ ]]; then
+        echo "$v"
+    else
+        echo 0
+    fi
+}
+
+
+fmt_a() {
+    awk -v x="$1" 'BEGIN {
+        printf "%.3f", x/1000000
+    }'
+}
+
+
+fmt_v() {
+    awk -v x="$1" 'BEGIN {
+        printf "%.3f", x/1000000
+    }'
+}
+
+
+fmt_w() {
+    awk -v x="$1" 'BEGIN {
+        printf "%.2f", x/1000000
+    }'
+}
+
+
+# µV × µA -> µW
+power_uw() {
+    echo $(( $1 * $2 / 1000000 ))
+}
+
+
+# ------------------------------------------------------------
+# Bar
+# ------------------------------------------------------------
+
+bar() {
+    local percent="$1"
+    local width="${2:-42}"
+
+    (( percent < 0 )) && percent=0
+    (( percent > 100 )) && percent=100
+
+    local filled=$((percent * width / 100))
+    local empty=$((width - filled))
+
+    printf '['
+    printf '%*s' "$filled" '' | tr ' ' '#'
+    printf '%*s' "$empty" '' | tr ' ' '.'
+    printf ']'
+}
+
+
+# ------------------------------------------------------------
+# Position color
+# ------------------------------------------------------------
+
+position_color() {
+    local p="$1"
+
+    if (( p >= 95 )); then
+        echo "$GREEN"
+    elif (( p >= 85 )); then
+        echo "$CYAN"
+    elif (( p >= 70 )); then
+        echo "$YELLOW"
+    else
+        echo "$RED"
+    fi
+}
+
+
+position_label() {
+    local p="$1"
+
+    if (( p >= 95 )); then
+        echo "EXCELLENT"
+    elif (( p >= 85 )); then
+        echo "GOOD"
+    elif (( p >= 70 )); then
+        echo "FAIR"
+    else
+        echo "POOR"
+    fi
+}
+
+
+# ------------------------------------------------------------
+# History
+# ------------------------------------------------------------
+
+declare -a power_history=()
+
+peak_power_uw=0
+max_avg_power_uw=0
+
 
 # ------------------------------------------------------------
 # Main loop
@@ -59,362 +193,367 @@ fi
 while true; do
 
     # ========================================================
-    # Read current
+    # DC INPUT
     # ========================================================
 
-    raw_current=$(get_current)
+    dc_voltage_uv=$(num "$(read_num \
+        /sys/class/power_supply/dc/voltage_now)")
 
-    if ! [[ "$raw_current" =~ ^-?[0-9]+$ ]]; then
-        raw_current=0
-    fi
+    dc_current_ua=$(num "$(read_num \
+        /sys/class/power_supply/dc/current_now)")
 
-    current_a=$(awk \
-        "BEGIN {printf \"%.3f\", $raw_current / 1000000}")
+    dc_current_max_ua=$(num "$(read_num \
+        /sys/class/power_supply/dc/current_max)")
 
-    abs_current=$(awk \
-        "BEGIN {
-            v=$raw_current/1000000
-            if(v<0)v=-v
-            printf \"%.3f\",v
-        }")
+    dc_voltage_max_uv=$(num "$(read_num \
+        /sys/class/power_supply/dc/voltage_max)")
 
-    # ========================================================
-    # Read battery information
-    # ========================================================
+    dc_online=$(read_num \
+        /sys/class/power_supply/dc/online)
 
-    wireless=$(get_battery_value "Wireless powered")
-    status=$(get_battery_value "status")
-    level=$(get_battery_value "level")
-    voltage_mv=$(get_battery_value "voltage")
-    temperature_raw=$(get_battery_value "temperature")
+    dc_present=$(read_num \
+        /sys/class/power_supply/dc/present)
 
-    max_current_raw=$(get_battery_value "Max charging current")
-    max_voltage_raw=$(get_battery_value "Max charging voltage")
 
     # ========================================================
-    # Validate values
+    # MAIN CHARGER
     # ========================================================
 
-    [[ "$level" =~ ^[0-9]+$ ]] || level=0
-    [[ "$voltage_mv" =~ ^[0-9]+$ ]] || voltage_mv=0
-    [[ "$temperature_raw" =~ ^[0-9]+$ ]] || temperature_raw=0
-    [[ "$max_current_raw" =~ ^[0-9]+$ ]] || max_current_raw=0
-    [[ "$max_voltage_raw" =~ ^[0-9]+$ ]] || max_voltage_raw=0
+    charger_status=$(read_text \
+        /sys/class/power_supply/main-charger/status)
 
-    temperature=$(awk \
-        "BEGIN {printf \"%.1f\", $temperature_raw / 10}")
+    charger_type=$(read_text \
+        /sys/class/power_supply/main-charger/charge_type)
 
-    voltage=$(awk \
-        "BEGIN {printf \"%.3f\", $voltage_mv / 1000}")
+    charger_current_ua=$(num "$(read_num \
+        /sys/class/power_supply/main-charger/current_now)")
 
-    max_current=$(awk \
-        "BEGIN {printf \"%.3f\", $max_current_raw / 1000000}")
+    charger_voltage_uv=$(num "$(read_num \
+        /sys/class/power_supply/main-charger/voltage_now)")
 
-    max_voltage=$(awk \
-        "BEGIN {printf \"%.2f\", $max_voltage_raw / 1000000}")
 
     # ========================================================
-    # Determine charging state
-    #
-    # Pixel 8a:
-    #   status 2 = CHARGING
-    #   status 3 = DISCHARGING
-    #   status 4 = NOT CHARGING
-    #   status 5 = FULL
+    # BATTERY
+    # ========================================================
+
+    battery_current_ua=$(num "$(read_num \
+        /sys/class/power_supply/battery/current_now)")
+
+    battery_voltage_uv=$(num "$(read_num \
+        /sys/class/power_supply/battery/voltage_now)")
+
+    battery_capacity=$(num "$(read_num \
+        /sys/class/power_supply/battery/capacity)")
+
+    battery_temp=$(num "$(read_num \
+        /sys/class/power_supply/battery/temp)")
+
+    battery_status=$(read_text \
+        /sys/class/power_supply/battery/status)
+
+
+    # ========================================================
+    # ANDROID BATTERY SERVICE
+    # ========================================================
+
+    dumpsys=$($ADB shell dumpsys battery 2>/dev/null | tr -d '\r')
+
+    wireless=$(echo "$dumpsys" |
+        awk -F': ' '/Wireless powered:/ {
+            print $2; exit
+        }')
+
+    max_charge_current=$(echo "$dumpsys" |
+        awk -F': ' '/Max charging current:/ {
+            print $2; exit
+        }')
+
+    max_charge_voltage=$(echo "$dumpsys" |
+        awk -F': ' '/Max charging voltage:/ {
+            print $2; exit
+        }')
+
+    android_level=$(echo "$dumpsys" |
+        awk -F': ' '/level:/ {
+            print $2; exit
+        }')
+
+    android_voltage_mv=$(echo "$dumpsys" |
+        awk -F': ' '/voltage:/ {
+            print $2; exit
+        }')
+
+    android_temp=$(echo "$dumpsys" |
+        awk -F': ' '/temperature:/ {
+            print $2; exit
+        }')
+
+
+    # ========================================================
+    # CHARGING
     # ========================================================
 
     charging=false
 
-    if [[ "$raw_current" -gt 0 ]] &&
-       [[ "$wireless" == "true" ]] &&
-       [[ "$status" == "2" ]]; then
+    if [[ "$dc_online" == "1" &&
+          "$dc_present" == "1" &&
+          "$wireless" == "true" ]]; then
         charging=true
     fi
 
+
     # ========================================================
-    # Charging sample history
+    # POWER
+    # ========================================================
+
+    if (( dc_voltage_uv > 0 && dc_current_ua > 0 )); then
+        dc_power_uw=$(power_uw \
+            "$dc_voltage_uv" "$dc_current_ua")
+    else
+        dc_power_uw=0
+    fi
+
+
+    if (( battery_voltage_uv > 0 &&
+          battery_current_ua > 0 )); then
+
+        battery_power_uw=$(power_uw \
+            "$battery_voltage_uv" "$battery_current_ua")
+    else
+        battery_power_uw=0
+    fi
+
+
+    if (( charger_voltage_uv > 0 &&
+          charger_current_ua > 0 )); then
+
+        charger_power_uw=$(power_uw \
+            "$charger_voltage_uv" "$charger_current_ua")
+    else
+        charger_power_uw=0
+    fi
+
+
+    # ========================================================
+    # 5 SECOND AVERAGE
+    # ========================================================
+
+    power_history+=("$dc_power_uw")
+
+    while (( ${#power_history[@]} > AVG_SECONDS )); do
+        power_history=("${power_history[@]:1}")
+    done
+
+    sum=0
+
+    for p in "${power_history[@]}"; do
+        sum=$((sum + p))
+    done
+
+    if (( ${#power_history[@]} )); then
+        avg_power_uw=$((sum / ${#power_history[@]}))
+    else
+        avg_power_uw=0
+    fi
+
+
+    # ========================================================
+    # PEAK
+    # ========================================================
+
+    (( dc_power_uw > peak_power_uw )) &&
+        peak_power_uw=$dc_power_uw
+
+    (( avg_power_uw > max_avg_power_uw )) &&
+        max_avg_power_uw=$avg_power_uw
+
+
+    # ========================================================
+    # POSITION QUALITY
+    # ========================================================
+
+    if (( max_avg_power_uw > 0 )); then
+        position_quality=$(
+            awk -v a="$avg_power_uw" \
+                -v m="$max_avg_power_uw" \
+                'BEGIN {
+                    printf "%.0f", a/m*100
+                }'
+        )
+    else
+        position_quality=0
+    fi
+
+    (( position_quality > 100 )) &&
+        position_quality=100
+
+    pc=$(position_color "$position_quality")
+    pl=$(position_label "$position_quality")
+
+
+    # ========================================================
+    # DC LIMIT
+    # ========================================================
+
+    if (( dc_voltage_max_uv > 0 &&
+          dc_current_max_ua > 0 )); then
+
+        dc_limit_power_uw=$(power_uw \
+            "$dc_voltage_max_uv" "$dc_current_max_ua")
+
+        dc_utilization=$(
+            awk -v p="$avg_power_uw" \
+                -v m="$dc_limit_power_uw" \
+                'BEGIN {
+                    if (m > 0)
+                        printf "%.0f", p/m*100
+                    else
+                        print 0
+                }'
+        )
+    else
+        dc_limit_power_uw=0
+        dc_utilization=0
+    fi
+
+
+    # ========================================================
+    # EFFICIENCY
+    # ========================================================
+
+    if (( dc_power_uw > 0 &&
+          battery_power_uw > 0 )); then
+
+        efficiency=$(
+            awk -v b="$battery_power_uw" \
+                -v d="$dc_power_uw" \
+                'BEGIN {
+                    printf "%.0f", b/d*100
+                }'
+        )
+    else
+        efficiency=0
+    fi
+
+
+    # ========================================================
+    # BATTERY DIRECTION
+    # ========================================================
+
+    if (( battery_current_ua >= 0 )); then
+        battery_direction="${GREEN}CHG${RESET}"
+    else
+        battery_direction="${RED}LOAD${RESET}"
+    fi
+
+
+    # ========================================================
+    # STATUS
     # ========================================================
 
     if $charging; then
-
-        samples+=("$raw_current")
-
-        if (( ${#samples[@]} > MAX_SAMPLES )); then
-            samples=("${samples[@]:1}")
-        fi
-
-        # ----------------------------------------------------
-        # Calculate 5-second average
-        # ----------------------------------------------------
-
-        sum=0
-
-        for value in "${samples[@]}"; do
-            sum=$((sum + value))
-        done
-
-        sample_count=${#samples[@]}
-
-        avg_current_ua=$((sum / sample_count))
-
-        avg_current=$(awk \
-            "BEGIN {printf \"%.3f\", $avg_current_ua / 1000000}")
-
-        # ----------------------------------------------------
-        # Dynamic maximum
-        #
-        # Highest 5-second average seen this session.
-        # ----------------------------------------------------
-
-        if (( avg_current_ua > max_avg_current_ua )); then
-            max_avg_current_ua=$avg_current_ua
-        fi
-
-        max_avg_current=$(awk \
-            "BEGIN {printf \"%.3f\", $max_avg_current_ua / 1000000}")
-
-        # ----------------------------------------------------
-        # Instantaneous peak
-        # ----------------------------------------------------
-
-        if (( raw_current > peak_current_ua )); then
-            peak_current_ua=$raw_current
-        fi
-
-        peak_current=$(awk \
-            "BEGIN {printf \"%.3f\", $peak_current_ua / 1000000}")
-
+        status="${BG_GREEN} CHARGING ${RESET}"
     else
-
-        samples=()
-        avg_current_ua=0
-        avg_current=0
-
-        # Don't reset max_avg_current_ua.
-        # It survives temporary disconnects during this run.
-
-        max_avg_current=$(awk \
-            "BEGIN {printf \"%.3f\", $max_avg_current_ua / 1000000}")
-
+        status="${BG_RED} NOT CHARGING ${RESET}"
     fi
 
-    # ========================================================
-    # Power
-    # ========================================================
-
-    instant_power=$(awk \
-        "BEGIN {
-            printf \"%.2f\",
-            ($raw_current/1000000) * ($voltage_mv/1000)
-        }")
-
-    avg_power=$(awk \
-        "BEGIN {
-            printf \"%.2f\",
-            ($avg_current_ua/1000000) * ($voltage_mv/1000)
-        }")
 
     # ========================================================
-    # Dynamic position quality
-    #
-    # 100% = best average measured this session
-    # ========================================================
-
-    if $charging && (( max_avg_current_ua > 0 )); then
-
-        quality_percent=$(awk \
-            "BEGIN {
-                q=($avg_current_ua/$max_avg_current_ua)*100
-                if(q>100)q=100
-                if(q<0)q=0
-                printf \"%d\",q+0.5
-            }")
-
-        # 70 character bar
-        filled=$(awk \
-            "BEGIN {
-                printf \"%d\",
-                ($avg_current_ua/$max_avg_current_ua)*70
-            }")
-
-        (( filled < 0 )) && filled=0
-        (( filled > 70 )) && filled=70
-
-        empty=$((70-filled))
-
-        bar=$(printf '%*s' "$filled" '' | tr ' ' '#')
-        bar="$bar$(printf '%*s' "$empty" '' | tr ' ' '.')"
-
-        # Text classification
-        if (( quality_percent >= 95 )); then
-            quality="EXCELLENT"
-        elif (( quality_percent >= 85 )); then
-            quality="VERY GOOD"
-        elif (( quality_percent >= 70 )); then
-            quality="GOOD"
-        elif (( quality_percent >= 50 )); then
-            quality="FAIR"
-        elif (( quality_percent >= 30 )); then
-            quality="POOR"
-        else
-            quality="VERY POOR"
-        fi
-
-    else
-
-        quality_percent=0
-        quality="NOT CHARGING"
-        bar="......................................................................"
-
-    fi
-
-    # ========================================================
-    # Status
-    # ========================================================
-
-    if $charging; then
-
-        charge_status="CHARGING"
-        wireless_status="YES"
-
-    else
-
-        wireless_status="NO"
-
-        case "$status" in
-            3)
-                charge_status="DISCHARGING"
-                ;;
-            4)
-                charge_status="NOT CHARGING"
-                ;;
-            5)
-                charge_status="FULL"
-                ;;
-            *)
-                charge_status="UNKNOWN"
-                ;;
-        esac
-
-    fi
-
-    # ========================================================
-    # Clear screen
+    # RENDER
     # ========================================================
 
     printf '\033[2J\033[H'
 
-    # ========================================================
-    # Display
-    # ========================================================
-
-    echo "======================================================================"
-    echo "                 PIXEL 8a WIRELESS CHARGE MONITOR"
-    echo "======================================================================"
+    echo -e "${BOLD}${CYAN} Pixel 8a / VW Golf — Wireless Charging Monitor v5.1${RESET}"
+    echo -e "${DIM} $(date '+%H:%M:%S')${RESET}"
     echo
 
-    printf "Charging     : %-14s Wireless: %s\n" \
-        "$charge_status" "$wireless_status"
+    # --------------------------------------------------------
+    # STATUS LINE
+    # --------------------------------------------------------
 
-    printf "Battery      : %3s %%          Temperature: %5s °C\n" \
-        "$level" "$temperature"
-
-    printf "Voltage      : %5s V\n" "$voltage"
-
-    echo
-    echo "----------------------------------------------------------------------"
+    echo -e " STATUS: $status   Wireless: ${BOLD}${wireless:-false}${RESET}   Battery: ${BOLD}${android_level:-$battery_capacity}%${RESET}   Temp: ${BOLD}$(awk -v t="${android_temp:-$battery_temp}" 'BEGIN {printf "%.1f",t/10}')°C${RESET}"
     echo
 
-    if $charging; then
 
-        echo "ACTUAL BATTERY CHARGING CURRENT"
-        echo "Average : ${AVG_SECONDS} seconds"
-        echo
+    # --------------------------------------------------------
+    # POSITION
+    # --------------------------------------------------------
 
-        printf "[%s]\n" "$bar"
+    echo -e "${BOLD}${WHITE} POSITION QUALITY${RESET}"
 
-        printf "                    %.3f A\n" \
-            "$avg_current"
+    printf " "
+    echo -ne "${pc}"
+    bar "$position_quality" 50
+    echo -e " ${BOLD}${position_quality}%${RESET} ${pl}${RESET}"
 
-        echo
-        printf "Instant      : %6.3f A       %5.2f W\n" \
-            "$current_a" "$instant_power"
-
-        printf "5-sec average: %6.3f A       %5.2f W\n" \
-            "$avg_current" "$avg_power"
-
-        printf "Peak         : %6.3f A\n" \
-            "$peak_current"
-
-    else
-
-        echo "BATTERY CONSUMPTION"
-        echo
-
-        printf "Current draw : %6.3f A\n" \
-            "$abs_current"
-
-        printf "Power draw   : %6.2f W\n" \
-            "$(awk "BEGIN {
-                printf \"%.2f\",
-                $abs_current * ($voltage_mv/1000)
-            }")"
-
-        echo
-        echo "Charging current: N/A"
-
-    fi
-
-    echo
-    echo "----------------------------------------------------------------------"
+    echo -e " Best: ${BOLD}$(fmt_w "$max_avg_power_uw") W${RESET}   Now: ${BOLD}$(fmt_w "$avg_power_uw") W${RESET}   Peak: ${BOLD}$(fmt_w "$peak_power_uw") W${RESET}"
     echo
 
-    echo "ANDROID CHARGING LIMITS"
+
+    # --------------------------------------------------------
+    # THREE COLUMN MEASUREMENTS
+    # --------------------------------------------------------
+
+echo -e "${BOLD}${CYAN} INPUT${RESET}                         ${BOLD}${CYAN}CHARGER${RESET}                       ${BOLD}${CYAN}BATTERY${RESET}"
+
+printf " %-29s %-29s %-29s\n" \
+    "Voltage  $(fmt_v "$dc_voltage_uv") V" \
+    "Type     ${charger_type:-N/A}" \
+    "Voltage  $(fmt_v "$battery_voltage_uv") V"
+
+printf " %-29s %-29s %-29s\n" \
+    "Current  $(fmt_a "$dc_current_ua") A" \
+    "Status   ${charger_status:-N/A}" \
+    "Current  $(fmt_a "$battery_current_ua") A"
+
+printf " %-29s %-29s %-29s\n" \
+    "Power    $(fmt_w "$dc_power_uw") W" \
+    "Power    $(fmt_w "$charger_power_uw") W" \
+    "Power    $(fmt_w "$battery_power_uw") W"
+
+printf " %-29s %-29s %-29s\n" \
+    "5-sec    $(fmt_w "$avg_power_uw") W" \
+    "Voltage  $(fmt_v "$charger_voltage_uv") V"
+
+echo
+
+
+    # --------------------------------------------------------
+    # LIMITS
+    # --------------------------------------------------------
+
+    echo -e "${BOLD}${YELLOW} REPORTED INPUT LIMITS${RESET}"
+
+    printf " DC: %s V × %s A = %s W    Utilization: %s%%\n" \
+        "$(fmt_v "$dc_voltage_max_uv")" \
+        "$(fmt_a "$dc_current_max_ua")" \
+        "$(fmt_w "$dc_limit_power_uw")" \
+        "$dc_utilization"
+
+    printf " Android: %s V × %s A\n" \
+        "$(awk -v x="${max_charge_voltage:-0}" \
+            'BEGIN {printf "%.3f",x/1000000}')" \
+        "$(awk -v x="${max_charge_current:-0}" \
+            'BEGIN {printf "%.3f",x/1000000}')"
+
     echo
 
-    if [[ "$max_current_raw" -gt 0 ]]; then
-        printf "Reported max : %6.3f A\n" "$max_current"
-    else
-        echo "Reported max : N/A"
-    fi
 
-    if [[ "$max_voltage_raw" -gt 0 ]]; then
-        printf "Max voltage  : %6.2f V\n" "$max_voltage"
-    else
-        echo "Max voltage  : N/A"
-    fi
+    # --------------------------------------------------------
+    # EXTRA
+    # --------------------------------------------------------
 
-    echo
-    echo "----------------------------------------------------------------------"
-    echo
+    echo -e "${BOLD}${MAGENTA} OTHER${RESET}"
 
-    echo "DYNAMIC POSITION REFERENCE"
-    echo
-
-    printf "Session max  : %6.3f A  (best 5-sec average)\n" \
-        "$max_avg_current"
-
-    if $charging; then
-        printf "Current       : %6.3f A\n" \
-            "$avg_current"
-
-        printf "Position      : %3d %%  %s\n" \
-            "$quality_percent" "$quality"
-
-        echo
-        printf "[%s]\n" "$bar"
-    else
-        echo "Position      : N/A (not charging)"
-        echo
-        echo "[......................................................................]"
-    fi
+    printf " DC online: %s   Present: %s   DC→battery: ~%s%%   Avg window: %ss\n" \
+        "$dc_online" \
+        "$dc_present" \
+        "${efficiency:-N/A}" \
+        "$AVG_SECONDS"
 
     echo
-    echo "----------------------------------------------------------------------"
-    echo
-    echo "Reference resets when this script is restarted."
-    echo "Press Ctrl+C to exit."
-    echo
+    echo -e "${DIM} Move the phone slowly to find the highest position score.  Ctrl+C to exit.${RESET}"
 
     sleep "$INTERVAL"
 
