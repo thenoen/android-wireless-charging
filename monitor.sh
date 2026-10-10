@@ -190,103 +190,72 @@ max_avg_power_uw=0
 # Main loop
 # ------------------------------------------------------------
 
+read_all() {
+    adb shell '
+        read_value() {
+            if [ -r "$2" ]; then
+                printf "%s=" "$1"
+                cat "$2"
+            else
+                printf "%s=\n" "$1"
+            fi
+        }
+
+        read_value dc_voltage /sys/class/power_supply/dc/voltage_now
+        read_value dc_current /sys/class/power_supply/dc/current_now
+        read_value dc_current_max /sys/class/power_supply/dc/current_max
+        read_value dc_voltage_max /sys/class/power_supply/dc/voltage_max
+        read_value dc_online /sys/class/power_supply/dc/online
+        read_value dc_present /sys/class/power_supply/dc/present
+
+        read_value charger_status /sys/class/power_supply/main-charger/status
+        read_value charger_type /sys/class/power_supply/main-charger/charge_type
+        read_value charger_current /sys/class/power_supply/main-charger/current_now
+        read_value charger_voltage /sys/class/power_supply/main-charger/voltage_now
+
+        read_value battery_current /sys/class/power_supply/battery/current_now
+        read_value battery_voltage /sys/class/power_supply/battery/voltage_now
+        read_value battery_capacity /sys/class/power_supply/battery/capacity
+        read_value battery_temp /sys/class/power_supply/battery/temp
+        read_value battery_status /sys/class/power_supply/battery/status
+
+        dumpsys battery
+    ' 2>/dev/null | tr -d '\r'
+}
+
 while true; do
 
-    # ========================================================
-    # DC INPUT
-    # ========================================================
+    data=$(read_all)
 
-    dc_voltage_uv=$(num "$(read_num \
-        /sys/class/power_supply/dc/voltage_now)")
+    get_value() {
+    printf '%s\n' "$data" |
+        awk -F= -v key="$1" '$1 == key { print $2; exit }'
+    }
 
-    dc_current_ua=$(num "$(read_num \
-        /sys/class/power_supply/dc/current_now)")
+    dc_voltage_uv=$(num "$(get_value dc_voltage)")
+    dc_current_ua=$(num "$(get_value dc_current)")
+    dc_current_max_ua=$(num "$(get_value dc_current_max)")
+    dc_voltage_max_uv=$(num "$(get_value dc_voltage_max)")
+    dc_online=$(get_value dc_online)
+    dc_present=$(get_value dc_present)
 
-    dc_current_max_ua=$(num "$(read_num \
-        /sys/class/power_supply/dc/current_max)")
+    charger_status=$(get_value charger_status)
+    charger_type=$(get_value charger_type)
+    charger_current_ua=$(num "$(get_value charger_current)")
+    charger_voltage_uv=$(num "$(get_value charger_voltage)")
 
-    dc_voltage_max_uv=$(num "$(read_num \
-        /sys/class/power_supply/dc/voltage_max)")
+    battery_current_ua=$(num "$(get_value battery_current)")
+    battery_voltage_uv=$(num "$(get_value battery_voltage)")
+    battery_capacity=$(num "$(get_value battery_capacity)")
+    battery_temp=$(num "$(get_value battery_temp)")
+    battery_status=$(get_value battery_status)
 
-    dc_online=$(read_num \
-        /sys/class/power_supply/dc/online)
-
-    dc_present=$(read_num \
-        /sys/class/power_supply/dc/present)
-
-
-    # ========================================================
-    # MAIN CHARGER
-    # ========================================================
-
-    charger_status=$(read_text \
-        /sys/class/power_supply/main-charger/status)
-
-    charger_type=$(read_text \
-        /sys/class/power_supply/main-charger/charge_type)
-
-    charger_current_ua=$(num "$(read_num \
-        /sys/class/power_supply/main-charger/current_now)")
-
-    charger_voltage_uv=$(num "$(read_num \
-        /sys/class/power_supply/main-charger/voltage_now)")
-
-
-    # ========================================================
-    # BATTERY
-    # ========================================================
-
-    battery_current_ua=$(num "$(read_num \
-        /sys/class/power_supply/battery/current_now)")
-
-    battery_voltage_uv=$(num "$(read_num \
-        /sys/class/power_supply/battery/voltage_now)")
-
-    battery_capacity=$(num "$(read_num \
-        /sys/class/power_supply/battery/capacity)")
-
-    battery_temp=$(num "$(read_num \
-        /sys/class/power_supply/battery/temp)")
-
-    battery_status=$(read_text \
-        /sys/class/power_supply/battery/status)
-
-
-    # ========================================================
-    # ANDROID BATTERY SERVICE
-    # ========================================================
-
-    dumpsys=$($ADB shell dumpsys battery 2>/dev/null | tr -d '\r')
-
-    wireless=$(echo "$dumpsys" |
-        awk -F': ' '/Wireless powered:/ {
-            print $2; exit
-        }')
-
-    max_charge_current=$(echo "$dumpsys" |
-        awk -F': ' '/Max charging current:/ {
-            print $2; exit
-        }')
-
-    max_charge_voltage=$(echo "$dumpsys" |
-        awk -F': ' '/Max charging voltage:/ {
-            print $2; exit
-        }')
-
-    android_level=$(echo "$dumpsys" |
-        awk -F': ' '/level:/ {
-            print $2; exit
-        }')
-
-    android_voltage_mv=$(echo "$dumpsys" |
-        awk -F': ' '/voltage:/ {
-            print $2; exit
-        }')
-
-    android_temp=$(echo "$dumpsys" |
-        awk -F': ' '/temperature:/ {
-            print $2; exit
-        }')
+    wireless=$(printf '%s\n' "$data" | awk -F': ' '/Wireless powered:/ {print $2; exit}')
+    max_charge_current=$(printf '%s\n' "$data" | awk -F': ' '/Max charging current:/ {print $2; exit}')
+    max_charge_voltage=$(printf '%s\n' "$data" | awk -F': ' '/Max charging voltage:/ {print $2; exit}')
+    android_level=$(printf '%s\n' "$data" | awk -F': ' '$1 == "  level" {print $2; exit}')
+    android_voltage_mv=$(printf '%s\n' "$data" | awk -F': ' '$1 == "  voltage" {print $2; exit}')
+    android_temp=$(printf '%s\n' "$data" | awk -F': ' '$1 == "  temperature" {print $2; exit}')
 
 
     # ========================================================
